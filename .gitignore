@@ -1,0 +1,32 @@
+# Microscope data and registered outputs
+exp/
+*.tif
+*.tiff
+shifts/
+*_shifts.csv
+registration.log
+*.partial
+.stackreg_work/
+
+# Local ImageJ/Fiji installations and third-party plugin binaries
+ImageJ/
+Fiji.app/
+
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local smoke-test working directories
+.imagej_smoke/
+.parallel_smoke_*/
+.real_stackreg_smoke_*/
+.test_runtime_*/
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
