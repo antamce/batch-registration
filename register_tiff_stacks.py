@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Build paired stacks and register both channels with ImageJ MultiStackReg.
+"""Register paired TIFF planes or paired, preassembled TIFF stacks.
 
-ChanB is aligned sequentially with translation-only StackReg/TurboReg.  The
-exact same transformations are applied to ChanA by MultiStackReg.  Final files
-are uncompressed, one-series OME BigTIFF stacks with ZYX axes.
+By default, ChanB (or r in preassembled mode) is aligned sequentially with
+translation-only StackReg/TurboReg. The exact same transformations are applied
+to the other channel by MultiStackReg. Output can be OME-BigTIFF or classic
+ImageJ TIFF, with one uncompressed ZYX series.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ except ImportError as exc:  # pragma: no cover
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
 CHANNEL_RE = re.compile(r"^(ChanA|ChanB)(?P<key>.*)$", re.IGNORECASE)
+STACK_CHANNEL_RE = re.compile(r"^(?P<prefix>.+)(?P<channel>[gr])$", re.IGNORECASE)
 NATURAL_PART_RE = re.compile(r"(\d+)")
 MEMORY_RE = re.compile(r"^[1-9]\d*[kKmMgG]$")
 LOG_NAME = "registration.log"
@@ -57,6 +59,9 @@ class Specimen:
     folder: Path
     output_prefix: str
     pairs: tuple[ImagePair, ...]
+    prestacked: bool = False
+    relative_output_dir: Path = Path()
+    channel_labels: tuple[str, str] = ("ChanA", "ChanB")
 
 
 @dataclass(frozen=True)
@@ -175,6 +180,101 @@ def discover_specimens(input_path: Path) -> tuple[list[Specimen], list[str]]:
     return [s for s in specimens if s.folder not in rejected], issues
 
 
+def _stack_layout(path: Path) -> tuple[int, tuple[int, int], np.dtype[Any]]:
+    with tifffile.TiffFile(path) as tif:
+        if len(tif.series) != 1:
+            raise ValueError(f"expected one TIFF series, found {len(tif.series)}")
+        series = tif.series[0]
+        if series.axes != "ZYX" or len(series.shape) != 3:
+            raise ValueError(f"expected a grayscale ZYX stack, got axes={series.axes} shape={series.shape}")
+        if len(series.pages) != series.shape[0] or series.shape[0] < 2:
+            raise ValueError(f"expected at least two physical Z pages, got shape={series.shape} pages={len(series.pages)}")
+        if np.dtype(series.dtype).kind not in "buif":
+            raise ValueError(f"unsupported pixel dtype {series.dtype}")
+        return int(series.shape[0]), (int(series.shape[1]), int(series.shape[2])), np.dtype(series.dtype)
+
+
+def discover_prestacked(input_path: Path) -> tuple[list[Specimen], list[str]]:
+    """Find same-folder TIFF pairs whose final stem character is g/r."""
+    root = input_path.resolve()
+    if not root.is_dir():
+        raise ValueError(f"input path is not a directory: {root}")
+    specimens: list[Specimen] = []
+    issues: list[str] = []
+    for current, dirs, files in os.walk(root):
+        dirs.sort(key=natural_key)
+        folder = Path(current)
+        grouped: dict[tuple[str, str], dict[str, Path]] = {}
+        display_prefixes: dict[tuple[str, str], str] = {}
+        for name in sorted(files, key=natural_key):
+            path = folder / name
+            if path.suffix.casefold() not in TIFF_SUFFIXES:
+                continue
+            match = STACK_CHANNEL_RE.fullmatch(path.stem)
+            if match is None:
+                continue
+            try:
+                z_count, _, _ = _stack_layout(path)
+            except Exception as exc:
+                # Single-plane TIFFs are intentionally outside this mode. Other
+                # malformed candidates are reported when they look like stacks.
+                try:
+                    with tifffile.TiffFile(path) as tif:
+                        if len(tif.pages) <= 1:
+                            continue
+                except Exception:
+                    pass
+                issues.append(f"{path}: {exc}")
+                continue
+            if z_count < 2:  # defensive; _stack_layout already enforces this
+                continue
+            prefix = match.group("prefix")
+            key = (prefix.casefold(), path.suffix.casefold())
+            channel = match.group("channel").casefold()
+            if channel in grouped.setdefault(key, {}):
+                issues.append(f"{folder}: duplicate {channel} stack for {prefix!r}{path.suffix}")
+                continue
+            grouped[key][channel] = path
+            display_prefixes.setdefault(key, prefix)
+
+        folder_specimens: list[Specimen] = []
+        for key in sorted(grouped, key=lambda item: natural_key(item[0] + item[1])):
+            channels = grouped[key]
+            prefix = display_prefixes[key]
+            if set(channels) != {"g", "r"}:
+                missing = "r" if "g" in channels else "g"
+                issues.append(f"{folder}: incomplete stack pair {prefix!r}; missing {missing} channel")
+                continue
+            g_path, r_path = channels["g"], channels["r"]
+            try:
+                g_layout, r_layout = _stack_layout(g_path), _stack_layout(r_path)
+                if g_layout != r_layout:
+                    raise ValueError(
+                        f"g/r stacks differ: {g_path.name} has {g_layout[0]}x{g_layout[1][0]}x{g_layout[1][1]}/{g_layout[2]}, "
+                        f"{r_path.name} has {r_layout[0]}x{r_layout[1][0]}x{r_layout[1][1]}/{r_layout[2]}"
+                    )
+            except Exception as exc:
+                issues.append(f"{folder}: invalid stack pair {prefix!r}: {exc}")
+                continue
+            pairs = tuple(ImagePair(str(index), g_path, r_path) for index in range(1, g_layout[0] + 1))
+            folder_specimens.append(
+                Specimen(folder, prefix, pairs, True, folder.relative_to(root), ("g", "r"))
+            )
+
+        by_output = {}
+        for specimen in folder_specimens:
+            by_output.setdefault(specimen.output_prefix.casefold(), []).append(specimen)
+        for same_name in by_output.values():
+            if len(same_name) > 1:
+                issues.append(
+                    f"{folder}: output-name collision for stack pairs: "
+                    + ", ".join(item.output_prefix for item in same_name)
+                )
+            else:
+                specimens.extend(same_name)
+    return specimens, issues
+
+
 def read_plane(path: Path) -> np.ndarray[Any, Any]:
     # Read physical page 0 explicitly: microscope OME metadata can refer to all
     # acquisition files and make tifffile.imread(path) expand one source image.
@@ -222,7 +322,66 @@ def _z_spacing(folder: Path) -> tuple[float | None, str | None]:
         return None, f"could not read Z calibration from Experiment.xml: {exc}"
 
 
+def _distance_um(value: Any, unit: Any) -> float | None:
+    try:
+        number = abs(float(value))
+    except (TypeError, ValueError):
+        return None
+    normalized = str(unit or "um").strip().casefold().replace("μ", "µ")
+    factors = {
+        "nm": 0.001,
+        "um": 1.0,
+        "µm": 1.0,
+        "micron": 1.0,
+        "microns": 1.0,
+        "mm": 1000.0,
+        "cm": 10000.0,
+        "m": 1_000_000.0,
+        "inch": 25400.0,
+        "in": 25400.0,
+    }
+    factor = factors.get(normalized)
+    if factor is None or not math.isfinite(number) or number <= 0:
+        return None
+    return number * factor
+
+
+def _embedded_z_spacing(path: Path) -> tuple[float | None, str | None]:
+    with tifffile.TiffFile(path) as tif:
+        if tif.ome_metadata:
+            try:
+                root = ET.fromstring(tif.ome_metadata)
+                pixels = next(node for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "Pixels")
+                spacing = _distance_um(
+                    pixels.attrib.get("PhysicalSizeZ"), pixels.attrib.get("PhysicalSizeZUnit", "um")
+                )
+                if spacing is not None:
+                    return spacing, None
+            except (ET.ParseError, StopIteration):
+                pass
+        imagej = tif.imagej_metadata or {}
+        spacing = _distance_um(imagej.get("spacing"), imagej.get("unit", "um"))
+        if spacing is not None:
+            return spacing, None
+    return None, f"{path.name} has no usable embedded Z calibration"
+
+
 def inspect_source(specimen: Specimen) -> SourceMetadata:
+    if specimen.prestacked:
+        g_path, r_path = specimen.pairs[0].chan_a, specimen.pairs[0].chan_b
+        g_layout, r_layout = _stack_layout(g_path), _stack_layout(r_path)
+        if g_layout != r_layout:
+            raise ValueError(f"g/r stacks differ: {g_layout} vs {r_layout}")
+        _, shape, dtype = r_layout
+        resolution, unit, physical = _xy_resolution(r_path)
+        spacing, embedded_warning = _embedded_z_spacing(r_path)
+        warnings: list[str] = []
+        if spacing is None:
+            spacing, xml_warning = _z_spacing(specimen.folder)
+            warnings.append(embedded_warning or "embedded Z calibration is missing")
+            if xml_warning is not None:
+                warnings.append(xml_warning)
+        return SourceMetadata(shape, dtype, resolution, unit, physical, spacing, tuple(warnings))
     a, b = read_plane(specimen.pairs[0].chan_a), read_plane(specimen.pairs[0].chan_b)
     if a.shape != b.shape or a.dtype != b.dtype:
         raise ValueError(f"first ChanA/ChanB planes differ: {a.shape}/{a.dtype} vs {b.shape}/{b.dtype}")
@@ -266,6 +425,12 @@ def _check_plane(plane: np.ndarray[Any, Any], path: Path, metadata: SourceMetada
 
 
 def _source_planes(specimen: Specimen, metadata: SourceMetadata, channel: str) -> Iterable[np.ndarray[Any, Any]]:
+    if specimen.prestacked:
+        path = specimen.pairs[0].chan_a if channel == "ChanA" else specimen.pairs[0].chan_b
+        with tifffile.TiffFile(path) as tif:
+            for page in tif.series[0].pages:
+                yield _check_plane(np.asarray(page.asarray()), path, metadata)
+        return
     for pair in specimen.pairs:
         path = pair.chan_a if channel == "ChanA" else pair.chan_b
         yield _check_plane(read_plane(path), path, metadata)
@@ -324,7 +489,10 @@ def parse_transforms(path: Path, specimen: Specimen) -> list[ShiftRecord]:
     expected = max(0, len(specimen.pairs) - 1)
     if len(blocks) != expected:
         raise ValueError(f"transformation file has {len(blocks)} translations; expected {expected}")
-    records = [ShiftRecord(1, specimen.pairs[0].chan_a.name, specimen.pairs[0].chan_b.name, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)]
+    def source_name(source: Path, page: int) -> str:
+        return f"{source.name}#page={page}" if specimen.prestacked else source.name
+
+    records = [ShiftRecord(1, source_name(specimen.pairs[0].chan_a, 1), source_name(specimen.pairs[0].chan_b, 1), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)]
     cumulative_x = cumulative_y = 0.0
     for slice_number, start in enumerate(blocks, start=2):
         try:
@@ -336,7 +504,7 @@ def parse_transforms(path: Path, specimen: Specimen) -> list[ShiftRecord]:
         cumulative_x += dx
         cumulative_y += dy
         pair = specimen.pairs[slice_number - 1]
-        records.append(ShiftRecord(slice_number, pair.chan_a.name, pair.chan_b.name, dx, dy, cumulative_x, cumulative_y, source_x, source_y, target_x, target_y))
+        records.append(ShiftRecord(slice_number, source_name(pair.chan_a, slice_number), source_name(pair.chan_b, slice_number), dx, dy, cumulative_x, cumulative_y, source_x, source_y, target_x, target_y))
     return records
 
 
@@ -358,27 +526,36 @@ def _plugin_planes(path: Path, expected: int) -> Iterable[np.ndarray[Any, Any]]:
             yield np.asarray(page.asarray())
 
 
-def write_final_stack(path: Path, plugin_output: Path, metadata: SourceMetadata, z_count: int) -> None:
+def write_final_stack(
+    path: Path, plugin_output: Path, metadata: SourceMetadata, z_count: int, imagej_tiff: bool = False
+) -> None:
     kwargs: dict[str, Any] = {}
     if metadata.resolution is not None:
         kwargs["resolution"] = metadata.resolution
     if metadata.resolution_unit is not None:
         kwargs["resolutionunit"] = metadata.resolution_unit
-    with tifffile.TiffWriter(path, bigtiff=True, ome=True) as writer:
+    writer_options = {"imagej": True} if imagej_tiff else {"bigtiff": True, "ome": True}
+    output_metadata = _imagej_metadata(metadata) if imagej_tiff else _ome_metadata(metadata)
+    with tifffile.TiffWriter(path, **writer_options) as writer:
         writer.write(
             _plugin_planes(plugin_output, z_count),
             shape=(z_count, *metadata.shape), dtype=metadata.dtype,
             photometric="minisblack", compression=None, contiguous=True,
-            metadata=_ome_metadata(metadata), **kwargs,
+            metadata=output_metadata, **kwargs,
         )
 
 
-def validate_stack(path: Path, expected_shape: tuple[int, int, int], expected_dtype: np.dtype[Any]) -> None:
+def validate_stack(
+    path: Path, expected_shape: tuple[int, int, int], expected_dtype: np.dtype[Any], imagej_tiff: bool = False
+) -> None:
     with tifffile.TiffFile(path) as tif:
         series = tif.series[0]
-        checks = [
-            (tif.is_bigtiff, "is not BigTIFF"),
-            (tif.ome_metadata is not None, "has no OME metadata"),
+        format_checks = (
+            [(not tif.is_bigtiff, "is BigTIFF"), (tif.is_imagej, "is not an ImageJ TIFF")]
+            if imagej_tiff
+            else [(tif.is_bigtiff, "is not BigTIFF"), (tif.ome_metadata is not None, "has no OME metadata")]
+        )
+        checks = format_checks + [
             (len(tif.series) == 1, f"has {len(tif.series)} image series"),
             (tuple(series.shape) == expected_shape, f"has shape {series.shape}, expected {expected_shape}"),
             (series.axes == "ZYX", f"has axes {series.axes}, expected ZYX"),
@@ -391,18 +568,37 @@ def validate_stack(path: Path, expected_shape: tuple[int, int, int], expected_dt
                 raise RuntimeError(f"validation failed: {path} {detail}")
 
 
-def write_shift_csv(path: Path, records: Sequence[ShiftRecord]) -> None:
+def write_shift_csv(
+    path: Path, records: Sequence[ShiftRecord], channel_labels: tuple[str, str] = ("ChanA", "ChanB")
+) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["slice_number", "source_ChanA", "source_ChanB", "incremental_dx", "incremental_dy", "cumulative_dx", "cumulative_dy", "stackreg_source_x", "stackreg_source_y", "stackreg_target_x", "stackreg_target_y", "engine"])
+        writer.writerow(["slice_number", f"source_{channel_labels[0]}", f"source_{channel_labels[1]}", "incremental_dx", "incremental_dy", "cumulative_dx", "cumulative_dy", "stackreg_source_x", "stackreg_source_y", "stackreg_target_x", "stackreg_target_y", "engine"])
         for r in records:
             writer.writerow([r.slice_number, r.chan_a_name, r.chan_b_name, r.incremental_dx, r.incremental_dy, r.cumulative_dx, r.cumulative_dy, r.source_x, r.source_y, r.target_x, r.target_y, "ImageJ MultiStackReg / StackReg / TurboReg"])
 
 
-def process_specimen(specimen: Specimen, output_dir: Path, overwrite: bool, imagej: ImageJConfig, log_queue: Any = None) -> ProcessResult:
-    final_a = output_dir / f"{specimen.output_prefix}_ChanA_registered.tif"
-    final_b = output_dir / f"{specimen.output_prefix}_ChanB_registered.tif"
-    final_csv = output_dir / CSV_DIR_NAME / f"{specimen.output_prefix}_shifts.csv"
+def _output_paths(specimen: Specimen, output_dir: Path) -> tuple[Path, Path, Path]:
+    destination = output_dir / specimen.relative_output_dir
+    if specimen.prestacked:
+        final_a = destination / f"{specimen.output_prefix}{specimen.channel_labels[0]}_registered.tif"
+        final_b = destination / f"{specimen.output_prefix}{specimen.channel_labels[1]}_registered.tif"
+    else:
+        final_a = destination / f"{specimen.output_prefix}_{specimen.channel_labels[0]}_registered.tif"
+        final_b = destination / f"{specimen.output_prefix}_{specimen.channel_labels[1]}_registered.tif"
+    return final_a, final_b, destination / CSV_DIR_NAME / f"{specimen.output_prefix}_shifts.csv"
+
+
+def process_specimen(
+    specimen: Specimen,
+    output_dir: Path,
+    overwrite: bool,
+    imagej: ImageJConfig,
+    log_queue: Any = None,
+    align_chan_a: bool = False,
+    imagej_tiff: bool = False,
+) -> ProcessResult:
+    final_a, final_b, final_csv = _output_paths(specimen, output_dir)
     completed = (final_a, final_b, final_csv)
     if not overwrite and all(path.is_file() for path in completed):
         emit(log_queue, logging.INFO, f"[{specimen.output_prefix}] skipped: completed outputs exist")
@@ -410,29 +606,39 @@ def process_specimen(specimen: Specimen, output_dir: Path, overwrite: bool, imag
     partial = tuple(path.with_name(path.name + ".partial") for path in completed)
     work = output_dir / WORK_DIR_NAME / f"{specimen.output_prefix}.{os.getpid()}.{uuid.uuid4().hex}"
     try:
+        final_a.parent.mkdir(parents=True, exist_ok=True)
+        final_csv.parent.mkdir(parents=True, exist_ok=True)
         for path in partial:
             path.unlink(missing_ok=True)
         work.mkdir(parents=True)
         metadata = inspect_source(specimen)
         for warning in metadata.warnings:
             emit(log_queue, logging.WARNING, f"[{specimen.output_prefix}] {warning}")
-        emit(log_queue, logging.INFO, f"[{specimen.output_prefix}] assembling {len(specimen.pairs)} slices for ImageJ")
         input_a, input_b = work / "ChanA.tif", work / "ChanB.tif"
         plugin_a, plugin_b = work / "ChanA_registered.tif", work / "ChanB_registered.tif"
         transforms = work / "stackreg_transforms.txt"
-        write_imagej_input(input_a, specimen, metadata, "ChanA")
-        write_imagej_input(input_b, specimen, metadata, "ChanB")
-        emit(log_queue, logging.INFO, f"[{specimen.output_prefix}] running ImageJ translation-only MultiStackReg")
-        imagej_output = run_stackreg(imagej, input_a, input_b, plugin_a, plugin_b, transforms)
+        if specimen.prestacked:
+            input_a, input_b = specimen.pairs[0].chan_a, specimen.pairs[0].chan_b
+            emit(log_queue, logging.INFO, f"[{specimen.output_prefix}] using {len(specimen.pairs)}-slice preassembled g/r stacks")
+        else:
+            emit(log_queue, logging.INFO, f"[{specimen.output_prefix}] assembling {len(specimen.pairs)} slices for ImageJ")
+            write_imagej_input(input_a, specimen, metadata, "ChanA")
+            write_imagej_input(input_b, specimen, metadata, "ChanB")
+        aligned_label = specimen.channel_labels[0] if align_chan_a else specimen.channel_labels[1]
+        emit(log_queue, logging.INFO, f"[{specimen.output_prefix}] running ImageJ translation-only MultiStackReg; alignment channel={aligned_label}")
+        if align_chan_a:
+            imagej_output = run_stackreg(imagej, input_b, input_a, plugin_b, plugin_a, transforms)
+        else:
+            imagej_output = run_stackreg(imagej, input_a, input_b, plugin_a, plugin_b, transforms)
         if imagej_output:
             emit(log_queue, logging.INFO, f"[{specimen.output_prefix}] ImageJ: {imagej_output[-1000:]}")
         records = parse_transforms(transforms, specimen)
-        write_final_stack(partial[0], plugin_a, metadata, len(specimen.pairs))
-        write_final_stack(partial[1], plugin_b, metadata, len(specimen.pairs))
+        write_final_stack(partial[0], plugin_a, metadata, len(specimen.pairs), imagej_tiff)
+        write_final_stack(partial[1], plugin_b, metadata, len(specimen.pairs), imagej_tiff)
         expected = (len(specimen.pairs), *metadata.shape)
-        validate_stack(partial[0], expected, metadata.dtype)
-        validate_stack(partial[1], expected, metadata.dtype)
-        write_shift_csv(partial[2], records)
+        validate_stack(partial[0], expected, metadata.dtype, imagej_tiff)
+        validate_stack(partial[1], expected, metadata.dtype, imagej_tiff)
+        write_shift_csv(partial[2], records, specimen.channel_labels)
         os.replace(partial[0], final_a)
         os.replace(partial[1], final_b)
         os.replace(partial[2], final_csv)  # completion marker, promoted last
@@ -478,6 +684,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imagej-memory", default="8g", help="maximum Java heap per worker (default: 8g)")
     parser.add_argument("--overwrite", action="store_true", help="replace completed outputs")
     parser.add_argument("--dry-run", action="store_true", help="discover and pair inputs only")
+    parser.add_argument(
+        "--prestacked", action="store_true",
+        help="register preassembled stacks paired by a final g/r filename character",
+    )
+    parser.add_argument(
+        "--align-g", action="store_true",
+        help="with --prestacked, align g and apply the same transforms to r (default: align r)",
+    )
+    parser.add_argument(
+        "--imagej-tiff", action="store_true",
+        help="write classic ImageJ TIFF outputs instead of OME-BigTIFF",
+    )
     return parser
 
 
@@ -486,15 +704,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.workers < 1:
         print("ERROR: --workers must be at least 1", file=sys.stderr)
         return 2
+    if args.align_g and not args.prestacked:
+        print("ERROR: --align-g requires --prestacked", file=sys.stderr)
+        return 2
     try:
-        specimens, issues = discover_specimens(args.input_path)
+        discovery = discover_prestacked if args.prestacked else discover_specimens
+        specimens, issues = discovery(args.input_path)
         imagej = None if args.dry_run else resolve_imagej_config(args.imagej_dir, args.imagej_memory)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    print(f"Discovered {len(specimens)} valid specimen folder(s).")
+    discovered_kind = "stack pair(s)" if args.prestacked else "specimen folder(s)"
+    print(f"Discovered {len(specimens)} valid {discovered_kind}.")
     for specimen in specimens:
-        print(f"  {specimen.folder} -> {specimen.output_prefix} ({len(specimen.pairs)} paired slices)")
+        destination = specimen.relative_output_dir / specimen.output_prefix
+        print(f"  {specimen.folder} -> {destination} ({len(specimen.pairs)} paired slices)")
     for issue in issues:
         print(f"WARNING: skipped invalid input: {issue}", file=sys.stderr)
     if args.dry_run:
@@ -510,7 +734,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     (output / CSV_DIR_NAME).mkdir(parents=True, exist_ok=True)
     (output / WORK_DIR_NAME).mkdir(parents=True, exist_ok=True)
     logger = configure_logger(output / LOG_NAME)
-    logger.info("Run started: input=%s output=%s specimens=%d workers=%d ImageJ=%s memory=%s", args.input_path.resolve(), output, len(specimens), args.workers, args.imagej_dir.resolve(), args.imagej_memory)
+    logger.info(
+        "Run started: input=%s output=%s specimens=%d workers=%d ImageJ=%s memory=%s prestacked=%s alignment_channel=%s output_format=%s",
+        args.input_path.resolve(), output, len(specimens), args.workers, args.imagej_dir.resolve(),
+        args.imagej_memory, args.prestacked, "g" if args.align_g else ("r" if args.prestacked else "ChanB"),
+        "ImageJ TIFF" if args.imagej_tiff else "OME-BigTIFF",
+    )
     for issue in issues:
         logger.warning("Skipped invalid input: %s", issue)
     import multiprocessing
@@ -521,7 +750,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         thread.start()
         try:
             with ProcessPoolExecutor(max_workers=args.workers) as executor:
-                futures = {executor.submit(process_specimen, specimen, output, args.overwrite, imagej, queue): specimen for specimen in specimens}
+                futures = {
+                    executor.submit(
+                        process_specimen, specimen, output, args.overwrite, imagej, queue,
+                        args.align_g, args.imagej_tiff,
+                    ): specimen
+                    for specimen in specimens
+                }
                 for future in as_completed(futures):
                     specimen = futures[future]
                     try:

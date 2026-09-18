@@ -28,6 +28,83 @@ class RegistrationTests(unittest.TestCase):
         names = ["slice10", "slice2", "slice1"]
         self.assertEqual(sorted(names, key=registration.natural_key), ["slice1", "slice2", "slice10"])
 
+    def test_discovers_prestacked_pairs_and_preserves_relative_directories(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        root = project / f".test_runtime_{uuid.uuid4().hex}"
+        try:
+            nested = root / "day" / "group"
+            nested.mkdir(parents=True)
+            stack = np.zeros((3, 8, 9), dtype=np.uint16)
+            for folder in (root, nested):
+                tifffile.imwrite(folder / "sampleg.tif", stack, imagej=True, metadata={"axes": "ZYX"})
+                tifffile.imwrite(folder / "sampler.tif", stack, imagej=True, metadata={"axes": "ZYX"})
+            tifffile.imwrite(root / "singleg.tif", stack[0])
+            tifffile.imwrite(root / "singler.tif", stack[0])
+            tifffile.imwrite(root / "badg.tif", stack, imagej=True, metadata={"axes": "ZYX"})
+            tifffile.imwrite(root / "badr.tif", stack[:2], imagej=True, metadata={"axes": "ZYX"})
+
+            specimens, issues = registration.discover_prestacked(root)
+            self.assertEqual(len(specimens), 2)
+            self.assertEqual({item.relative_output_dir for item in specimens}, {Path(), Path("day/group")})
+            self.assertTrue(any("g/r stacks differ" in issue for issue in issues), issues)
+            self.assertFalse(any("single" in issue for issue in issues), issues)
+
+            nested_specimen = next(item for item in specimens if item.relative_output_dir != Path())
+            output_paths = registration._output_paths(nested_specimen, root / "output")
+            self.assertEqual(output_paths[0], root / "output/day/group/sampleg_registered.tif")
+            self.assertEqual(output_paths[1], root / "output/day/group/sampler_registered.tif")
+            self.assertEqual(output_paths[2], root / "output/day/group/shifts/sample_shifts.csv")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_prestacked_align_g_writes_classic_imagej_tiffs(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        root = project / f".test_runtime_{uuid.uuid4().hex}"
+        input_dir, output_dir = root / "input", root / "output"
+        try:
+            input_dir.mkdir(parents=True)
+            rng = np.random.default_rng(123)
+            base_g = rng.integers(0, 4096, (64, 64), dtype=np.uint16)
+            base_r = np.zeros((64, 64), dtype=np.uint16)
+            base_r[20:24, 30:35] = 3000
+            drifts = [(0, 0), (2, -3), (5, -4), (4, 1)]
+            stack_g = np.stack([zero_shift(base_g, dy, dx) for dy, dx in drifts])
+            stack_r = np.stack([zero_shift(base_r, dy, dx) for dy, dx in drifts])
+            metadata = {"axes": "ZYX", "spacing": 0.5, "unit": "um"}
+            tifffile.imwrite(input_dir / "sampleg.tif", stack_g, imagej=True, metadata=metadata)
+            tifffile.imwrite(input_dir / "sampler.tif", stack_r, imagej=True, metadata=metadata)
+
+            specimens, issues = registration.discover_prestacked(input_dir)
+            self.assertEqual(issues, [])
+            self.assertEqual(len(specimens), 1)
+            source = registration.inspect_source(specimens[0])
+            self.assertEqual(source.z_spacing_um, 0.5)
+            config = registration.resolve_imagej_config(project / "ImageJ", "1g")
+            result = registration.process_specimen(
+                specimens[0], output_dir, False, config,
+                align_chan_a=True, imagej_tiff=True,
+            )
+            self.assertEqual(result.status, "completed", result.detail)
+
+            for channel in ("g", "r"):
+                path = output_dir / f"sample{channel}_registered.tif"
+                with tifffile.TiffFile(path) as tif:
+                    self.assertFalse(tif.is_bigtiff)
+                    self.assertTrue(tif.is_imagej)
+                    self.assertEqual(tif.series[0].axes, "ZYX")
+                    self.assertEqual(tif.series[0].shape, (4, 64, 64))
+                    self.assertTrue(all(page.compression.name == "NONE" for page in tif.pages))
+
+            registered_r = tifffile.imread(output_dir / "sampler_registered.tif")
+            peak_positions = [tuple(np.unravel_index(np.argmax(plane), plane.shape)) for plane in registered_r]
+            self.assertTrue(all(position == peak_positions[0] for position in peak_positions), peak_positions)
+            with (output_dir / "shifts/sample_shifts.csv").open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["source_g"], "sampleg.tif#page=1")
+            self.assertEqual(rows[0]["source_r"], "sampler.tif#page=1")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_plugin_end_to_end_writes_true_zyx_stacks(self) -> None:
         project = Path(__file__).resolve().parents[1]
         root = project / f".test_runtime_{uuid.uuid4().hex}"

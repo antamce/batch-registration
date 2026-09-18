@@ -1,15 +1,14 @@
 # Paired TIFF stack registration with ImageJ StackReg
 
-`register_tiff_stacks.py` recursively finds paired 2D `ChanA*.tif[f]` and
-`ChanB*.tif[f]` files and naturally sorts them. For each specimen it builds two
-true ImageJ stacks, registers ChanB sequentially with translation-only
-StackReg/TurboReg, and uses MultiStackReg to apply the identical transforms to
-ChanA.
+`register_tiff_stacks.py` registers paired two-channel TIFF data. By default it
+recursively finds paired 2D `ChanA*.tif[f]` and `ChanB*.tif[f]` files and builds
+them into stacks. With `--prestacked`, it instead finds existing `g`/`r` TIFF
+stacks. Registration uses translation-only StackReg/TurboReg, and
+MultiStackReg applies the identical transforms to the other channel.
 
-The final files are uncompressed, single-channel OME-BigTIFF Z-stacks. The
-script checks that each output has one `ZYX` series, the expected page count and
-data type, BigTIFF format, OME metadata, and no compression before marking the
-specimen complete.
+The default final files are uncompressed, single-channel OME-BigTIFF Z-stacks.
+The script checks each output's format, `ZYX` shape, page count, data type, and
+compression before marking the specimen complete.
 
 ## Requirements
 
@@ -51,6 +50,54 @@ Use another ImageJ installation if needed:
 ```powershell
 python register_tiff_stacks.py "D:\data\exp" "E:\registered" --imagej-dir "C:\Fiji.app"
 ```
+
+### Existing g/r stacks
+
+Use `--prestacked` when the input already contains stacks. A pair must be in
+the same folder and have identical names except for the final `g` or `r` before
+`.tif`/`.tiff`, for example `2306_1abg.tif` and `2306_1abr.tif`:
+
+```powershell
+python register_tiff_stacks.py "D:\data\stacks" "E:\registered" --prestacked
+```
+
+The input root itself and all subfolders are searched. Single-page TIFFs are
+ignored. Each pair must contain one grayscale `ZYX` series with matching page
+count, dimensions, and data type. Invalid pairs are reported and skipped while
+other valid pairs continue. Relative input directories are preserved under the
+output directory to prevent same-name collisions.
+
+By default, the `r` stack is aligned and the same transformations are applied
+to `g`. Invert that choice with:
+
+```powershell
+python register_tiff_stacks.py "D:\data\stacks" "E:\registered" --prestacked --align-g
+```
+
+Prestacked output names use the input basename, such as:
+
+```text
+2306_1abg_registered.tif
+2306_1abr_registered.tif
+shifts/
+  2306_1ab_shifts.csv
+```
+
+The shift CSV identifies stack slices as `filename.tif#page=N`, with page
+numbers starting at 1. Embedded OME or ImageJ calibration is used first;
+`Experiment.xml` is only a fallback.
+
+### Output TIFF format
+
+Outputs are uncompressed OME-BigTIFF by default. To write uncompressed classic
+ImageJ TIFF stacks instead, use `--imagej-tiff` in either input mode:
+
+```powershell
+python register_tiff_stacks.py "D:\data\stacks" "E:\registered" --prestacked --imagej-tiff
+```
+
+Classic TIFF has a 4 GB size limit, so this option should only be used when
+each resulting file will remain below that limit.
 
 Check recursive discovery, natural sorting, and channel pairing without reading
 pixels or running ImageJ:
