@@ -105,6 +105,70 @@ class RegistrationTests(unittest.TestCase):
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
+    def test_separate_folder_mode_registers_and_preserves_channel_metadata(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        root = project / f".test_runtime_{uuid.uuid4().hex}"
+        input_dir, output_dir = root / "input", root / "output"
+        g_dir = input_dir / "day1" / "sampleg2"
+        r_dir = input_dir / "day1" / "sampler2"
+        try:
+            g_dir.mkdir(parents=True)
+            r_dir.mkdir(parents=True)
+            rng = np.random.default_rng(456)
+            base_r = rng.integers(0, 4096, (64, 64), dtype=np.uint16)
+            base_g = np.zeros((64, 64), dtype=np.uint16)
+            base_g[20:24, 30:35] = 3000
+            drifts = [(0, 0), (2, -3), (5, -4), (4, 1)]
+            for index, (dy, dx) in enumerate(drifts, start=1):
+                key = f"_{index:04d}.tif"
+                tifffile.imwrite(g_dir / f"ChanA{key}", zero_shift(base_g, dy, dx))
+                tifffile.imwrite(r_dir / f"ChanB{key}", zero_shift(base_r, dy, dx))
+            (g_dir / "Experiment.xml").write_text(
+                '<ThorImageExperiment><ZStage stepSizeUM="-0.3" /></ThorImageExperiment>', encoding="utf-8"
+            )
+            (r_dir / "Experiment.xml").write_text(
+                '<ThorImageExperiment><ZStage stepSizeUM="-0.5" /></ThorImageExperiment>', encoding="utf-8"
+            )
+
+            orphan = input_dir / "day1" / "orphang"
+            orphan.mkdir()
+            tifffile.imwrite(orphan / "ChanA_0001.tif", base_g)
+            unrelated = input_dir / "day1" / "k1_2"
+            unrelated.mkdir()
+            tifffile.imwrite(unrelated / "ChanA_0001.tif", base_g)
+
+            specimens, issues = registration.discover_separate_folders(input_dir)
+            self.assertEqual(len(specimens), 1)
+            self.assertTrue(any("unpaired g channel folder" in issue for issue in issues), issues)
+            self.assertFalse(any("k1_2" in issue for issue in issues), issues)
+            specimen = specimens[0]
+            self.assertEqual(specimen.output_prefix, "day1_sample2")
+            self.assertEqual(specimen.channel_output_prefixes, ("day1_sampleg2", "day1_sampler2"))
+            outputs = registration._output_paths(specimen, output_dir)
+            self.assertEqual(outputs[0], output_dir / "day1_sampleg2_registered.tif")
+            self.assertEqual(outputs[1], output_dir / "day1_sampler2_registered.tif")
+            self.assertEqual(outputs[2], output_dir / "shifts/day1_sample2_shifts.csv")
+
+            metadata_g, metadata_r = registration.inspect_source_channels(specimen)
+            self.assertEqual(metadata_g.z_spacing_um, 0.3)
+            self.assertEqual(metadata_r.z_spacing_um, 0.5)
+            self.assertTrue(any("metadata differs" in warning for warning in metadata_g.warnings))
+
+            config = registration.resolve_imagej_config(project / "ImageJ", "1g")
+            result = registration.process_specimen(specimen, output_dir, False, config)
+            self.assertEqual(result.status, "completed", result.detail)
+            registered_g = tifffile.imread(outputs[0])
+            peak_positions = [tuple(np.unravel_index(np.argmax(plane), plane.shape)) for plane in registered_g]
+            self.assertTrue(all(position == peak_positions[0] for position in peak_positions), peak_positions)
+            self.assertAlmostEqual(registration._embedded_z_spacing(outputs[0])[0], 0.3)
+            self.assertAlmostEqual(registration._embedded_z_spacing(outputs[1])[0], 0.5)
+            with outputs[2].open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["source_g"], "ChanA_0001.tif")
+            self.assertEqual(rows[0]["source_r"], "ChanB_0001.tif")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_plugin_end_to_end_writes_true_zyx_stacks(self) -> None:
         project = Path(__file__).resolve().parents[1]
         root = project / f".test_runtime_{uuid.uuid4().hex}"

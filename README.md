@@ -3,7 +3,8 @@
 `register_tiff_stacks.py` registers paired two-channel TIFF data. By default it
 recursively finds paired 2D `ChanA*.tif[f]` and `ChanB*.tif[f]` files and builds
 them into stacks. With `--prestacked`, it instead finds existing `g`/`r` TIFF
-stacks. Registration uses translation-only StackReg/TurboReg, and
+stacks. With `--sepfolder`, it pairs individual green/red planes acquired in
+separate folders. Registration uses translation-only StackReg/TurboReg, and
 MultiStackReg applies the identical transforms to the other channel.
 
 The default final files are uncompressed, single-channel OME-BigTIFF Z-stacks.
@@ -98,6 +99,46 @@ python register_tiff_stacks.py "D:\data\stacks" "E:\registered" --prestacked --i
 
 Classic TIFF has a 4 GB size limit, so this option should only be used when
 each resulting file will remain below that limit.
+
+### Channels acquired in separate folders
+
+Use `--sepfolder` when green and red planes are stored in sibling acquisition
+folders:
+
+```text
+<input>/cafsynpo03062/kab7g2/ChanA_0001_0001_0001_0001.tif
+<input>/cafsynpo03062/kab7r2/ChanB_0001_0001_0001_0001.tif
+```
+
+```powershell
+python register_tiff_stacks.py "D:\data\separate" "E:\registered" --sepfolder
+```
+
+Folder names must have equal length and differ at exactly one character: `g`
+for the folder containing `ChanA` planes and `r` for the folder containing
+`ChanB` planes. The marker may occur anywhere, so `kab7g2`/`kab7r2` is valid.
+After the leading `ChanA`/`ChanB` is removed, paired TIFF filenames must match
+exactly, including their extension.
+
+All folder names below the supplied input root are flattened into the output
+names. The example above produces:
+
+```text
+cafsynpo03062_kab7g2_registered.tif
+cafsynpo03062_kab7r2_registered.tif
+shifts/
+  cafsynpo03062_kab72_shifts.csv
+```
+
+By default, `r` is aligned and its transformations are applied to `g`. Add
+`--align-g` to invert that behavior. `--imagej-tiff` is also supported.
+`--sepfolder` and `--prestacked` are mutually exclusive.
+
+Each channel's own XY and Z calibration is preserved in its corresponding
+output. Differences are logged as warnings but do not stop registration.
+Folders without an identifiable channel marker are ignored. An identifiable
+`g` or `r` folder without its partner is warned about and skipped; the other
+valid pairs still run, and the process exits nonzero after the batch finishes.
 
 Check recursive discovery, natural sorting, and channel pairing without reading
 pixels or running ImageJ:

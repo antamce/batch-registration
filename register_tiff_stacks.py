@@ -62,6 +62,9 @@ class Specimen:
     prestacked: bool = False
     relative_output_dir: Path = Path()
     channel_labels: tuple[str, str] = ("ChanA", "ChanB")
+    separate_folders: bool = False
+    channel_folders: tuple[Path, Path] | None = None
+    channel_output_prefixes: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -275,6 +278,145 @@ def discover_prestacked(input_path: Path) -> tuple[list[Specimen], list[str]]:
     return specimens, issues
 
 
+def _separate_channel_files(folder: Path, channel: str) -> dict[str, Path]:
+    expected = "chana" if channel == "g" else "chanb"
+    result: dict[str, Path] = {}
+    for path in folder.iterdir():
+        if not path.is_file() or path.suffix.casefold() not in TIFF_SUFFIXES:
+            continue
+        match = CHANNEL_RE.match(path.stem)
+        if match is None or match.group(1).casefold() != expected:
+            continue
+        # Preserve the entire portion after ChanA/ChanB, including extension.
+        # Separate-folder mode intentionally requires this key to match exactly.
+        key = match.group("key") + path.suffix
+        if key in result:
+            raise ValueError(f"duplicate {channel} slice key {key!r} in {folder}")
+        result[key] = path
+    return result
+
+
+def _folder_channel_position(g_name: str, r_name: str) -> int | None:
+    if len(g_name) != len(r_name):
+        return None
+    differences = [index for index, (g_char, r_char) in enumerate(zip(g_name, r_name)) if g_char != r_char]
+    if len(differences) != 1:
+        return None
+    index = differences[0]
+    return index if g_name[index].casefold() == "g" and r_name[index].casefold() == "r" else None
+
+
+def _flatten_relative(path: Path, root: Path) -> str:
+    return "_".join(path.relative_to(root).parts)
+
+
+def discover_separate_folders(input_path: Path) -> tuple[list[Specimen], list[str]]:
+    """Find sibling g/r acquisition folders containing matching ChanA/ChanB planes."""
+    root = input_path.resolve()
+    if not root.is_dir():
+        raise ValueError(f"input path is not a directory: {root}")
+    issues: list[str] = []
+    profiles: dict[Path, tuple[str, dict[str, Path]]] = {}
+    for current, dirs, _ in os.walk(root):
+        dirs.sort(key=natural_key)
+        folder = Path(current)
+        try:
+            g_files = _separate_channel_files(folder, "g")
+            r_files = _separate_channel_files(folder, "r")
+        except Exception as exc:
+            issues.append(f"{folder}: {exc}")
+            continue
+        name = folder.name.casefold()
+        if g_files and not r_files and "g" in name:
+            profiles[folder] = ("g", g_files)
+        elif r_files and not g_files and "r" in name:
+            profiles[folder] = ("r", r_files)
+
+    specimens: list[Specimen] = []
+    parents = sorted({folder.parent for folder in profiles}, key=lambda path: natural_key(str(path)))
+    for parent in parents:
+        green = sorted(
+            (folder for folder, (channel, _) in profiles.items() if folder.parent == parent and channel == "g"),
+            key=lambda path: natural_key(path.name),
+        )
+        red = sorted(
+            (folder for folder, (channel, _) in profiles.items() if folder.parent == parent and channel == "r"),
+            key=lambda path: natural_key(path.name),
+        )
+        g_matches = {g: [r for r in red if _folder_channel_position(g.name, r.name) is not None] for g in green}
+        r_matches = {r: [g for g in green if _folder_channel_position(g.name, r.name) is not None] for r in red}
+
+        for folder, matches in (*g_matches.items(), *r_matches.items()):
+            channel = profiles[folder][0]
+            if not matches:
+                issues.append(f"{folder}: unpaired {channel} channel folder")
+            elif len(matches) > 1:
+                issues.append(
+                    f"{folder}: ambiguous {channel} channel folder; matches "
+                    + ", ".join(str(path) for path in matches)
+                )
+
+        for g_folder in green:
+            matches = g_matches[g_folder]
+            if len(matches) != 1:
+                continue
+            r_folder = matches[0]
+            if len(r_matches[r_folder]) != 1:
+                continue
+            position = _folder_channel_position(g_folder.name, r_folder.name)
+            assert position is not None
+            g_files, r_files = profiles[g_folder][1], profiles[r_folder][1]
+            g_keys, r_keys = set(g_files), set(r_files)
+            if g_keys != r_keys:
+                details = []
+                if r_keys - g_keys:
+                    details.append(f"missing g keys: {sorted(r_keys-g_keys, key=natural_key)[:10]}")
+                if g_keys - r_keys:
+                    details.append(f"missing r keys: {sorted(g_keys-r_keys, key=natural_key)[:10]}")
+                issues.append(f"{g_folder} / {r_folder}: unpaired channel files; " + "; ".join(details))
+                continue
+
+            neutral_name = g_folder.name[:position] + g_folder.name[position + 1:]
+            relative_parent = parent.relative_to(root)
+            common_relative = relative_parent / neutral_name
+            pairs = tuple(
+                ImagePair(key, g_files[key], r_files[key])
+                for key in sorted(g_keys, key=natural_key)
+            )
+            specimens.append(
+                Specimen(
+                    parent,
+                    "_".join(common_relative.parts),
+                    pairs,
+                    False,
+                    Path(),
+                    ("g", "r"),
+                    True,
+                    (g_folder, r_folder),
+                    (_flatten_relative(g_folder, root), _flatten_relative(r_folder, root)),
+                )
+            )
+
+    by_output_name: dict[str, list[Specimen]] = {}
+    for specimen in specimens:
+        assert specimen.channel_output_prefixes is not None
+        for name in (*specimen.channel_output_prefixes, specimen.output_prefix):
+            by_output_name.setdefault(name.casefold(), []).append(specimen)
+    rejected: set[Specimen] = set()
+    for name, matching in by_output_name.items():
+        unique = list(dict.fromkeys(matching))
+        if len(unique) > 1:
+            rejected.update(unique)
+            issues.append(
+                f"output-name collision for {name!r}: "
+                + ", ".join(
+                    f"{item.channel_folders[0]} / {item.channel_folders[1]}"  # type: ignore[index]
+                    for item in unique
+                )
+            )
+    return [specimen for specimen in specimens if specimen not in rejected], issues
+
+
 def read_plane(path: Path) -> np.ndarray[Any, Any]:
     # Read physical page 0 explicitly: microscope OME metadata can refer to all
     # acquisition files and make tifffile.imread(path) expand one source image.
@@ -366,28 +508,78 @@ def _embedded_z_spacing(path: Path) -> tuple[float | None, str | None]:
     return None, f"{path.name} has no usable embedded Z calibration"
 
 
-def inspect_source(specimen: Specimen) -> SourceMetadata:
+def _plane_source_metadata(path: Path, folder: Path, image: np.ndarray[Any, Any]) -> SourceMetadata:
+    resolution, unit, physical = _xy_resolution(path)
+    spacing, warning = _z_spacing(folder)
+    return SourceMetadata(
+        image.shape, image.dtype, resolution, unit, physical, spacing,
+        () if warning is None else (warning,),
+    )
+
+
+def _stack_source_metadata(path: Path, folder: Path) -> SourceMetadata:
+    _, shape, dtype = _stack_layout(path)
+    resolution, unit, physical = _xy_resolution(path)
+    spacing, embedded_warning = _embedded_z_spacing(path)
+    warnings: list[str] = []
+    if spacing is None:
+        spacing, xml_warning = _z_spacing(folder)
+        warnings.append(embedded_warning or "embedded Z calibration is missing")
+        if xml_warning is not None:
+            warnings.append(xml_warning)
+    return SourceMetadata(shape, dtype, resolution, unit, physical, spacing, tuple(warnings))
+
+
+def _metadata_disagreement(a: SourceMetadata, b: SourceMetadata) -> str | None:
+    differences: list[str] = []
+    if a.resolution != b.resolution or a.resolution_unit != b.resolution_unit:
+        differences.append(f"XY resolution {a.resolution}/{a.resolution_unit} vs {b.resolution}/{b.resolution_unit}")
+    if (
+        (a.z_spacing_um is None) != (b.z_spacing_um is None)
+        or (
+            a.z_spacing_um is not None and b.z_spacing_um is not None
+            and not math.isclose(a.z_spacing_um, b.z_spacing_um, rel_tol=1e-9, abs_tol=1e-12)
+        )
+    ):
+        differences.append(f"Z spacing {a.z_spacing_um} um vs {b.z_spacing_um} um")
+    if not differences:
+        return None
+    return "g/r metadata differs; preserving each channel's calibration: " + "; ".join(differences)
+
+
+def inspect_source_channels(specimen: Specimen) -> tuple[SourceMetadata, SourceMetadata]:
+    a_path, b_path = specimen.pairs[0].chan_a, specimen.pairs[0].chan_b
     if specimen.prestacked:
-        g_path, r_path = specimen.pairs[0].chan_a, specimen.pairs[0].chan_b
-        g_layout, r_layout = _stack_layout(g_path), _stack_layout(r_path)
-        if g_layout != r_layout:
-            raise ValueError(f"g/r stacks differ: {g_layout} vs {r_layout}")
-        _, shape, dtype = r_layout
-        resolution, unit, physical = _xy_resolution(r_path)
-        spacing, embedded_warning = _embedded_z_spacing(r_path)
-        warnings: list[str] = []
-        if spacing is None:
-            spacing, xml_warning = _z_spacing(specimen.folder)
-            warnings.append(embedded_warning or "embedded Z calibration is missing")
-            if xml_warning is not None:
-                warnings.append(xml_warning)
-        return SourceMetadata(shape, dtype, resolution, unit, physical, spacing, tuple(warnings))
-    a, b = read_plane(specimen.pairs[0].chan_a), read_plane(specimen.pairs[0].chan_b)
-    if a.shape != b.shape or a.dtype != b.dtype:
-        raise ValueError(f"first ChanA/ChanB planes differ: {a.shape}/{a.dtype} vs {b.shape}/{b.dtype}")
-    resolution, unit, physical = _xy_resolution(specimen.pairs[0].chan_b)
-    spacing, warning = _z_spacing(specimen.folder)
-    return SourceMetadata(b.shape, b.dtype, resolution, unit, physical, spacing, () if warning is None else (warning,))
+        metadata_a = _stack_source_metadata(a_path, specimen.folder)
+        metadata_b = _stack_source_metadata(b_path, specimen.folder)
+    else:
+        a, b = read_plane(a_path), read_plane(b_path)
+        if a.shape != b.shape or a.dtype != b.dtype:
+            raise ValueError(f"first channel planes differ: {a.shape}/{a.dtype} vs {b.shape}/{b.dtype}")
+        if specimen.separate_folders:
+            assert specimen.channel_folders is not None
+            metadata_a = _plane_source_metadata(a_path, specimen.channel_folders[0], a)
+            metadata_b = _plane_source_metadata(b_path, specimen.channel_folders[1], b)
+        else:
+            # Preserve legacy behavior: ChanB supplies calibration for both outputs.
+            metadata_b = _plane_source_metadata(b_path, specimen.folder, b)
+            metadata_a = metadata_b
+    if metadata_a.shape != metadata_b.shape or metadata_a.dtype != metadata_b.dtype:
+        raise ValueError(
+            f"channel stacks differ: {metadata_a.shape}/{metadata_a.dtype} vs "
+            f"{metadata_b.shape}/{metadata_b.dtype}"
+        )
+    if specimen.separate_folders and (warning := _metadata_disagreement(metadata_a, metadata_b)):
+        metadata_a = SourceMetadata(
+            metadata_a.shape, metadata_a.dtype, metadata_a.resolution, metadata_a.resolution_unit,
+            metadata_a.pixel_size_um, metadata_a.z_spacing_um, (*metadata_a.warnings, warning),
+        )
+    return metadata_a, metadata_b
+
+
+def inspect_source(specimen: Specimen) -> SourceMetadata:
+    """Return the second channel's metadata for backward compatibility."""
+    return inspect_source_channels(specimen)[1]
 
 
 def resolve_imagej_config(imagej_dir: Path, memory: str) -> ImageJConfig:
@@ -580,7 +772,11 @@ def write_shift_csv(
 
 def _output_paths(specimen: Specimen, output_dir: Path) -> tuple[Path, Path, Path]:
     destination = output_dir / specimen.relative_output_dir
-    if specimen.prestacked:
+    if specimen.separate_folders:
+        assert specimen.channel_output_prefixes is not None
+        final_a = destination / f"{specimen.channel_output_prefixes[0]}_registered.tif"
+        final_b = destination / f"{specimen.channel_output_prefixes[1]}_registered.tif"
+    elif specimen.prestacked:
         final_a = destination / f"{specimen.output_prefix}{specimen.channel_labels[0]}_registered.tif"
         final_b = destination / f"{specimen.output_prefix}{specimen.channel_labels[1]}_registered.tif"
     else:
@@ -611,9 +807,14 @@ def process_specimen(
         for path in partial:
             path.unlink(missing_ok=True)
         work.mkdir(parents=True)
-        metadata = inspect_source(specimen)
-        for warning in metadata.warnings:
-            emit(log_queue, logging.WARNING, f"[{specimen.output_prefix}] {warning}")
+        metadata_a, metadata_b = inspect_source_channels(specimen)
+        metadata_sources = ((None, metadata_a),) if metadata_a is metadata_b else (
+            (specimen.channel_labels[0], metadata_a), (specimen.channel_labels[1], metadata_b)
+        )
+        for label, metadata in metadata_sources:
+            for warning in metadata.warnings:
+                qualifier = "" if label is None else f"{label}: "
+                emit(log_queue, logging.WARNING, f"[{specimen.output_prefix}] {qualifier}{warning}")
         input_a, input_b = work / "ChanA.tif", work / "ChanB.tif"
         plugin_a, plugin_b = work / "ChanA_registered.tif", work / "ChanB_registered.tif"
         transforms = work / "stackreg_transforms.txt"
@@ -622,8 +823,8 @@ def process_specimen(
             emit(log_queue, logging.INFO, f"[{specimen.output_prefix}] using {len(specimen.pairs)}-slice preassembled g/r stacks")
         else:
             emit(log_queue, logging.INFO, f"[{specimen.output_prefix}] assembling {len(specimen.pairs)} slices for ImageJ")
-            write_imagej_input(input_a, specimen, metadata, "ChanA")
-            write_imagej_input(input_b, specimen, metadata, "ChanB")
+            write_imagej_input(input_a, specimen, metadata_a, "ChanA")
+            write_imagej_input(input_b, specimen, metadata_b, "ChanB")
         aligned_label = specimen.channel_labels[0] if align_chan_a else specimen.channel_labels[1]
         emit(log_queue, logging.INFO, f"[{specimen.output_prefix}] running ImageJ translation-only MultiStackReg; alignment channel={aligned_label}")
         if align_chan_a:
@@ -633,16 +834,16 @@ def process_specimen(
         if imagej_output:
             emit(log_queue, logging.INFO, f"[{specimen.output_prefix}] ImageJ: {imagej_output[-1000:]}")
         records = parse_transforms(transforms, specimen)
-        write_final_stack(partial[0], plugin_a, metadata, len(specimen.pairs), imagej_tiff)
-        write_final_stack(partial[1], plugin_b, metadata, len(specimen.pairs), imagej_tiff)
-        expected = (len(specimen.pairs), *metadata.shape)
-        validate_stack(partial[0], expected, metadata.dtype, imagej_tiff)
-        validate_stack(partial[1], expected, metadata.dtype, imagej_tiff)
+        write_final_stack(partial[0], plugin_a, metadata_a, len(specimen.pairs), imagej_tiff)
+        write_final_stack(partial[1], plugin_b, metadata_b, len(specimen.pairs), imagej_tiff)
+        expected = (len(specimen.pairs), *metadata_a.shape)
+        validate_stack(partial[0], expected, metadata_a.dtype, imagej_tiff)
+        validate_stack(partial[1], expected, metadata_b.dtype, imagej_tiff)
         write_shift_csv(partial[2], records, specimen.channel_labels)
         os.replace(partial[0], final_a)
         os.replace(partial[1], final_b)
         os.replace(partial[2], final_csv)  # completion marker, promoted last
-        detail = f"completed {len(specimen.pairs)} slices; shape={expected}, dtype={metadata.dtype}"
+        detail = f"completed {len(specimen.pairs)} slices; shape={expected}, dtype={metadata_a.dtype}"
         emit(log_queue, logging.INFO, f"[{specimen.output_prefix}] {detail}")
         return ProcessResult(specimen.output_prefix, "completed", detail)
     except Exception as exc:
@@ -684,13 +885,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imagej-memory", default="8g", help="maximum Java heap per worker (default: 8g)")
     parser.add_argument("--overwrite", action="store_true", help="replace completed outputs")
     parser.add_argument("--dry-run", action="store_true", help="discover and pair inputs only")
-    parser.add_argument(
+    input_mode = parser.add_mutually_exclusive_group()
+    input_mode.add_argument(
         "--prestacked", action="store_true",
         help="register preassembled stacks paired by a final g/r filename character",
     )
+    input_mode.add_argument(
+        "--sepfolder", action="store_true",
+        help="pair individual ChanA/ChanB planes from sibling folders differing by one g/r character",
+    )
     parser.add_argument(
         "--align-g", action="store_true",
-        help="with --prestacked, align g and apply the same transforms to r (default: align r)",
+        help="with --prestacked or --sepfolder, align g and apply the same transforms to r (default: align r)",
     )
     parser.add_argument(
         "--imagej-tiff", action="store_true",
@@ -704,21 +910,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.workers < 1:
         print("ERROR: --workers must be at least 1", file=sys.stderr)
         return 2
-    if args.align_g and not args.prestacked:
-        print("ERROR: --align-g requires --prestacked", file=sys.stderr)
+    if args.align_g and not (args.prestacked or args.sepfolder):
+        print("ERROR: --align-g requires --prestacked or --sepfolder", file=sys.stderr)
         return 2
     try:
-        discovery = discover_prestacked if args.prestacked else discover_specimens
+        if args.prestacked:
+            discovery = discover_prestacked
+        elif args.sepfolder:
+            discovery = discover_separate_folders
+        else:
+            discovery = discover_specimens
         specimens, issues = discovery(args.input_path)
         imagej = None if args.dry_run else resolve_imagej_config(args.imagej_dir, args.imagej_memory)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    discovered_kind = "stack pair(s)" if args.prestacked else "specimen folder(s)"
+    discovered_kind = "stack pair(s)" if args.prestacked else (
+        "separate-folder pair(s)" if args.sepfolder else "specimen folder(s)"
+    )
     print(f"Discovered {len(specimens)} valid {discovered_kind}.")
     for specimen in specimens:
         destination = specimen.relative_output_dir / specimen.output_prefix
-        print(f"  {specimen.folder} -> {destination} ({len(specimen.pairs)} paired slices)")
+        source = (
+            " / ".join(map(str, specimen.channel_folders))
+            if specimen.channel_folders is not None else str(specimen.folder)
+        )
+        print(f"  {source} -> {destination} ({len(specimen.pairs)} paired slices)")
     for issue in issues:
         print(f"WARNING: skipped invalid input: {issue}", file=sys.stderr)
     if args.dry_run:
@@ -735,9 +952,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     (output / WORK_DIR_NAME).mkdir(parents=True, exist_ok=True)
     logger = configure_logger(output / LOG_NAME)
     logger.info(
-        "Run started: input=%s output=%s specimens=%d workers=%d ImageJ=%s memory=%s prestacked=%s alignment_channel=%s output_format=%s",
+        "Run started: input=%s output=%s specimens=%d workers=%d ImageJ=%s memory=%s input_mode=%s alignment_channel=%s output_format=%s",
         args.input_path.resolve(), output, len(specimens), args.workers, args.imagej_dir.resolve(),
-        args.imagej_memory, args.prestacked, "g" if args.align_g else ("r" if args.prestacked else "ChanB"),
+        args.imagej_memory,
+        "prestacked" if args.prestacked else ("separate-folders" if args.sepfolder else "paired-planes"),
+        "g" if args.align_g else ("r" if (args.prestacked or args.sepfolder) else "ChanB"),
         "ImageJ TIFF" if args.imagej_tiff else "OME-BigTIFF",
     )
     for issue in issues:
